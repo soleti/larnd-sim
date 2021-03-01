@@ -150,7 +150,7 @@ def run_simulation(input_filename,
                                                          end_pixel[0], end_pixel[1])
             neighboring_pixels = pixels_from_track.get_neighboring_pixels(np.array(pixels,dtype=np.int32),2)
             pixels_tracks = np.vstack((pixels_tracks,neighboring_pixels))
-            track_ids = np.append(track_ids,[it]*len(neighboring_pixels))
+            track_ids = np.append(track_ids,np.array([it]*len(neighboring_pixels),dtype=np.int32))
 
         unique_pix = np.unique(pixels_tracks,axis=0)
 
