@@ -288,6 +288,8 @@ def tracks_current(pixels_tracks_time, pixels_tracks, tracks, track_ids):
             z_step = (z_end_int-z_start_int) / (z_steps-1)
             t_start = max(time_interval[0], t["t_start"] // consts.t_sampling * consts.t_sampling)
 
+            total_current = 0
+
             for iz in range(z_steps):
 
                 z = z_start_int + iz*z_step
@@ -308,11 +310,15 @@ def tracks_current(pixels_tracks_time, pixels_tracks, tracks, track_ids):
 
                         y = y_start + sign(direction[1]) * (iy*y_step - 4*sigmas[1])
                         y_dist = abs(y_p - y)
+
                         if y_dist > pixel_size[1]/2:
                             continue
+
                         charge = rho((x,y,z), t["n_electrons"], start, sigmas, segment) \
                                  * abs(x_step) * abs(y_step) * abs(z_step)
-                        pixels_tracks_time[ipt,it] += current_model(time_tick, t0, x_dist, y_dist) * charge * consts.e_charge
+                        total_current += current_model(time_tick, t0, x_dist, y_dist) * charge * consts.e_charge
+
+            pixels_tracks_time[ipt,it] = total_current
 
 @nb.njit
 def sign(x):
@@ -322,7 +328,7 @@ def sign(x):
     return 1 if x >= 0 else -1
 
 @cuda.jit
-def sum_pixel_signals(pixels_signals, signals, track_starts, index_map):
+def sum_pixel_signals(pixels_signals, pixels_tracks_time, track_starts, pixel_index_map, track_ids):
     """
     This function sums the induced current signals on the same pixel.
 
@@ -338,17 +344,16 @@ def sum_pixel_signals(pixels_signals, signals, track_starts, index_map):
         index_map (:obj:`numpy.ndarray`): 2D array containing the correspondence between
             the track index and the pixel ID index.
     """
-    it, ipix, itick = cuda.grid(3)
+    ipt, it = cuda.grid(2)
 
-    if it < signals.shape[0] and ipix < signals.shape[1]:
+    if ipt < pixels_tracks_time.shape[0] and it < pixels_tracks_time.shape[1]:
 
-        index = index_map[it][ipix]
-        start_tick = int(track_starts[it] // consts.t_sampling)
+        pixel_index = pixel_index_map[ipt]
+        track_index = track_ids[ipt]
+        start_tick = int(track_starts[track_index] // consts.t_sampling)
 
-        if itick < signals.shape[2] and index >= 0:
-
-            itime = start_tick + itick
-            cuda.atomic.add(pixels_signals, (index, itime), signals[it][ipix][itick])
+        itime = start_tick + it
+        cuda.atomic.add(pixels_signals, (pixel_index, itime), pixels_tracks_time[ipt,it])
 
 @nb.njit
 def backtrack_adcs(tracks, adc_list, adc_times_list, track_pixel_map, event_id_map, backtracked_id):

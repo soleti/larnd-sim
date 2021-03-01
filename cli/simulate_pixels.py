@@ -134,6 +134,9 @@ def run_simulation(input_filename,
     for itrk in tqdm(range(0, tracks.shape[0], step), desc='Simulating pixels...'):
         selected_tracks = tracks[itrk:itrk+step]
 
+        unique_eventIDs = np.unique(selected_tracks['eventID'])
+        event_id_map = np.searchsorted(unique_eventIDs,np.asarray(selected_tracks['eventID']))
+
         pixels_tracks = np.empty((0,2),dtype=np.int32)
         track_ids = np.array([],dtype=np.int32)
 
@@ -144,13 +147,13 @@ def run_simulation(input_filename,
             end_pixel = (int((t["x_end"] - this_border[0][0]) // consts.pixel_size[0] + consts.n_pixels[0]*t["pixel_plane"]),
                         int((t["y_end"] - this_border[1][0]) // consts.pixel_size[1]))
             pixels = pixels_from_track.get_active_pixels(start_pixel[0], start_pixel[1],
-                                                end_pixel[0], end_pixel[1])
+                                                         end_pixel[0], end_pixel[1])
             neighboring_pixels = pixels_from_track.get_neighboring_pixels(np.array(pixels,dtype=np.int32),2)
             pixels_tracks = np.vstack((pixels_tracks,neighboring_pixels))
             track_ids = np.append(track_ids,[it]*len(neighboring_pixels))
 
-        unique_eventIDs = np.unique(selected_tracks['eventID'])
-        event_id_map = np.searchsorted(unique_eventIDs,selected_tracks['eventID'])
+        unique_pix = np.unique(pixels_tracks,axis=0)
+
         max_length = np.array([0])
         track_starts = np.empty(selected_tracks.shape[0])
         threadsperblock = 128
@@ -161,6 +164,12 @@ def run_simulation(input_filename,
         TPB = 1,512
         BPG = ceil(pixels_tracks_time.shape[0] / TPB[0]), ceil(pixels_tracks_time.shape[1] / TPB[1])
         detsim.tracks_current[BPG,TPB](pixels_tracks_time, pixels_tracks, selected_tracks, track_ids)
+
+        TPB = 1,512
+        BPG = ceil(pixels_tracks_time.shape[0] / TPB[0]), ceil(pixels_tracks_time.shape[1] / TPB[1])
+        pixel_index_map = np.ascontiguousarray(np.where((unique_pix==pixels_tracks[:,None]).all(-1))[1])
+        pixels_signals = np.zeros((len(unique_pix), len(consts.time_ticks)*len(unique_eventIDs)*2))
+        detsim.sum_pixel_signals[BPG,TPB](pixels_signals, pixels_tracks_time, track_starts, pixel_index_map, track_ids)
 
 
 if __name__ == "__main__":
