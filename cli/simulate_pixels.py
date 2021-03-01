@@ -164,7 +164,7 @@ def run_simulation(input_filename,
         TPB = 1,512
         BPG = ceil(pixels_tracks_time.shape[0] / TPB[0]), ceil(pixels_tracks_time.shape[1] / TPB[1])
         detsim.tracks_current[BPG,TPB](pixels_tracks_time, pixels_tracks, selected_tracks, track_ids)
-
+        print("is the calculation correct?", pixels_tracks_time.sum()/consts.e_charge*consts.t_sampling/sum(selected_tracks['n_electrons']))
         TPB = 1,512
         BPG = ceil(pixels_tracks_time.shape[0] / TPB[0]), ceil(pixels_tracks_time.shape[1] / TPB[1])
         pixel_index_map = np.ascontiguousarray(np.where((unique_pix==pixels_tracks[:,None]).all(-1))[1])
