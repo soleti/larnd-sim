@@ -242,93 +242,77 @@ def get_pixel_coordinates(pixel_id):
     return pix_x, pix_y
 
 @cuda.jit
-def tracks_current(signals, pixels, tracks):
-    """
-    This CUDA kernel calculates the charge induced on the pixels by the input tracks.
+def tracks_current(pixels_tracks_time, pixels_tracks, tracks, track_ids):
+    ipt, it = cuda.grid(2)
 
-    Args:
-        signals (:obj:`numpy.ndarray`): empty 3D array with dimensions S x P x T,
-            where S is the number of track segments, P is the number of pixels, and T is
-            the number of time ticks. The output is stored here.
-        pixels (:obj:`numpy.ndarray`): 3D array with dimensions S x P x 2, where S is
-            the number of track segments, P is the number of pixels and the third dimension
-            contains the two pixel ID numbers.
-        tracks (:obj:`numpy.ndarray`): 2D array containing the detector segments.
-    """
-    itrk, ipix, it = cuda.grid(3)
+    if ipt < pixels_tracks_time.shape[0] and it < pixels_tracks_time.shape[1]:
+        pID = pixels_tracks[ipt]
+        t = tracks[track_ids[ipt]]
 
-    if itrk < signals.shape[0] and ipix < signals.shape[1] and it < signals.shape[2]:
-        t = tracks[itrk]
-        pID = pixels[itrk][ipix]
+        # Pixel coordinates
+        x_p, y_p = get_pixel_coordinates(pID)
 
-        if pID[0] >= 0 and pID[1] >= 0:
+        if t["z_start"] < t["z_end"]:
+            start = (t["x_start"], t["y_start"], t["z_start"])
+            end = (t["x_end"], t["y_end"], t["z_end"])
+        else:
+            end = (t["x_start"], t["y_start"], t["z_start"])
+            start = (t["x_end"], t["y_end"], t["z_end"])
 
-            # Pixel coordinates
-            x_p, y_p = get_pixel_coordinates(pID)
+        segment = (end[0]-start[0], end[1]-start[1], end[2]-start[2])
+        length = sqrt(segment[0]**2 + segment[1]**2 + segment[2]**2)
 
-            if t["z_start"] < t["z_end"]:
-                start = (t["x_start"], t["y_start"], t["z_start"])
-                end = (t["x_end"], t["y_end"], t["z_end"])
-            else:
-                end = (t["x_start"], t["y_start"], t["z_start"])
-                start = (t["x_end"], t["y_end"], t["z_end"])
+        direction = (segment[0]/length, segment[1]/length, segment[2]/length)
+        sigmas = (t["tran_diff"], t["tran_diff"], t["long_diff"])
 
-            segment = (end[0]-start[0], end[1]-start[1], end[2]-start[2])
-            length = sqrt(segment[0]**2 + segment[1]**2 + segment[2]**2)
+        # The impact factor is the the size of the transverse diffusion or, if too small,
+        # half the diagonal of the pixel pad
+        impact_factor = max(sqrt((5*sigmas[0])**2 + (5*sigmas[1])**2),
+                            sqrt(pixel_size[0]**2 + pixel_size[1]**2)/2)*2
 
-            direction = (segment[0]/length, segment[1]/length, segment[2]/length)
-            sigmas = (t["tran_diff"], t["tran_diff"], t["long_diff"])
+        z_poca, z_start, z_end = z_interval(start, end, x_p, y_p, impact_factor)
 
-            # The impact factor is the the size of the transverse diffusion or, if too small,
-            # half the diagonal of the pixel pad
-            impact_factor = max(sqrt((5*sigmas[0])**2 + (5*sigmas[1])**2),
-                                sqrt(pixel_size[0]**2 + pixel_size[1]**2)/2)*2
+        if z_poca != 0:
+            z_start_int = z_start - 4*sigmas[2]
+            z_end_int = z_end + 4*sigmas[2]
 
-            z_poca, z_start, z_end = z_interval(start, end, x_p, y_p, impact_factor)
+            x_start, y_start = track_point(start, direction, z_start)
+            x_end, y_end = track_point(start, direction, z_end)
 
-            if z_poca != 0:
-                z_start_int = z_start - 4*sigmas[2]
-                z_end_int = z_end + 4*sigmas[2]
+            y_step = (abs(y_end-y_start) + 8*sigmas[1]) / (consts.sampled_points - 1)
+            x_step = (abs(x_end-x_start) + 8*sigmas[0]) / (consts.sampled_points - 1)
 
-                x_start, y_start = track_point(start, direction, z_start)
-                x_end, y_end = track_point(start, direction, z_end)
+            z_sampling = consts.t_sampling / 2.
+            z_steps = max(consts.sampled_points, ceil(abs(z_end_int-z_start_int) / z_sampling))
 
-                y_step = (abs(y_end-y_start) + 8*sigmas[1]) / (consts.sampled_points - 1)
-                x_step = (abs(x_end-x_start) + 8*sigmas[0]) / (consts.sampled_points - 1)
+            z_step = (z_end_int-z_start_int) / (z_steps-1)
+            t_start = max(time_interval[0], t["t_start"] // consts.t_sampling * consts.t_sampling)
 
-                z_sampling = consts.t_sampling / 2.
-                z_steps = max(consts.sampled_points, ceil(abs(z_end_int-z_start_int) / z_sampling))
+            for iz in range(z_steps):
 
-                z_step = (z_end_int-z_start_int) / (z_steps-1)
-                t_start = max(time_interval[0], t["t_start"] // consts.t_sampling * consts.t_sampling)
+                z = z_start_int + iz*z_step
+                time_tick = t_start + it*consts.t_sampling
+                t0 = (z - module_borders[t["pixel_plane"]][2][0]) / consts.vdrift
 
-                for iz in range(z_steps):
+                # FIXME: this sampling is far from ideal, we should sample around the track
+                # and not in a cube containing the track
+                for ix in range(consts.sampled_points):
 
-                    z = z_start_int + iz*z_step
-                    time_tick = t_start + it*consts.t_sampling
-                    t0 = (z - module_borders[t["pixel_plane"]][2][0]) / consts.vdrift
+                    x = x_start + sign(direction[0]) * (ix*x_step - 4*sigmas[0])
+                    x_dist = abs(x_p - x)
 
-                    # FIXME: this sampling is far from ideal, we should sample around the track
-                    # and not in a cube containing the track
-                    for ix in range(consts.sampled_points):
+                    if x_dist > pixel_size[0]/2:
+                        continue
 
-                        x = x_start + sign(direction[0]) * (ix*x_step - 4*sigmas[0])
-                        x_dist = abs(x_p - x)
+                    for iy in range(consts.sampled_points):
 
-                        if x_dist > pixel_size[0]/2:
+                        y = y_start + sign(direction[1]) * (iy*y_step - 4*sigmas[1])
+                        y_dist = abs(y_p - y)
+                        if y_dist > pixel_size[1]/2:
                             continue
-
-                        for iy in range(consts.sampled_points):
-
-                            y = y_start + sign(direction[1]) * (iy*y_step - 4*sigmas[1])
-                            y_dist = abs(y_p - y)
-
-                            if y_dist > pixel_size[1]/2:
-                                continue
-
-                            charge = rho((x,y,z), t["n_electrons"], start, sigmas, segment) \
-                                        * abs(x_step) * abs(y_step) * abs(z_step)
-                            signals[itrk,ipix,it] += current_model(time_tick, t0, x_dist, y_dist) * charge * consts.e_charge
+                        charge = rho((x,y,z), t["n_electrons"], start, sigmas, segment) \
+                                 * abs(x_step) * abs(y_step) * abs(z_step)
+                        pixels_tracks_time[ipt,it] += current_model(time_tick, t0, x_dist, y_dist) * charge * consts.e_charge
 
 @nb.njit
 def sign(x):

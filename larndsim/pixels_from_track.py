@@ -4,6 +4,8 @@ of each track segment. It can eventually include also the neighboring
 pixels.
 """
 
+import numpy as np
+
 from numba import cuda
 from .consts import pixel_size, n_pixels, module_borders
 
@@ -49,23 +51,9 @@ def get_pixels(tracks, active_pixels, neighboring_pixels, n_pixels_list, radius)
                                                      radius,
                                                      neighboring_pixels[itrk])
 
+def get_active_pixels(x0, y0, x1, y1):
 
-@cuda.jit(device=True)
-def get_active_pixels(x0, y0, x1, y1, tot_pixels):
-    """
-    Converts track segement to an array of active pixels
-    using Bresenham algorithm used to convert line to grid.
-
-    Args:
-        x0 (float): start `x` coordinate
-        y0 (float): start `y` coordinate
-        x1 (float): end `x` coordinate
-        y1 (float): end `y` coordinate
-        tot_pixels (:obj:`numpy.ndarray`): array where we store
-            the IDs of the pixels directly below the projection of
-            the segments
-    """
-
+    pixels = []
     dx = x1 - x0
     dy = y1 - y0
     xsign = 1 if dx > 0 else -1
@@ -88,52 +76,27 @@ def get_active_pixels(x0, y0, x1, y1, tot_pixels):
         y_id = y0 + x*xy + y*yy
         plane_id = x_id // n_pixels[0]
         if 0 <= x_id < n_pixels[0]*(plane_id+1) and 0 <= y_id < n_pixels[1]:
-            tot_pixels[x] = x_id, y_id
+            pixels.append((x_id, y_id))
         if D >= 0:
             y += 1
             D -= 2*dx
         D += 2*dy
 
+    return pixels
 
-@cuda.jit(device=True)
-def get_neighboring_pixels(active_pixels, radius, neighboring_pixels):
-    """
-    For each active_pixel, it includes all
-    neighboring pixels within a specified radius
-
-    Args:
-        active_pixels (:obj:`numpy.ndarray`): array where we store
-            the IDs of the pixels directly below the projection of
-            the segments
-        radius (int): number of layers of neighboring pixels we
-            want to consider
-        neighboring_pixels (:obj:`numpy.ndarray`): array where we store
-            the IDs of the pixels directly below the projection of
-            the segments and the ones next to them
-
-    Returns:
-        int: number of total involved pixels
-    """
-    count = 0
+def get_neighboring_pixels(active_pixels, radius):
+    neighboring_pixels = np.empty((0,2),dtype=np.int32)
 
     for pix in range(active_pixels.shape[0]):
-
-        if (active_pixels[pix][0] == -1) and (active_pixels[pix][1] == -1):
-            continue
-
         for x_r in range(-radius, radius+1):
             for y_r in range(-radius, radius+1):
-                new_pixel = (active_pixels[pix][0]+x_r, active_pixels[pix][1]+y_r)
+                new_pixel = np.array([active_pixels[pix][0]+x_r, active_pixels[pix][1]+y_r])
                 is_unique = True
-
-                for ipix in range(neighboring_pixels.shape[0]):
-                    if new_pixel[0] == neighboring_pixels[ipix][0] and new_pixel[1] == neighboring_pixels[ipix][1]:
-                        is_unique = False
-                        break
-
+                if any((neighboring_pixels[:]==new_pixel).all(1)):
+                    is_unique = False
                 plane_id = new_pixel[0] // n_pixels[0]
                 if is_unique and 0 <= new_pixel[0] < (plane_id+1)*n_pixels[0] and 0 <= new_pixel[1] < n_pixels[1] and plane_id < module_borders.shape[0]:
-                    neighboring_pixels[count] = new_pixel
-                    count += 1
+                    neighboring_pixels = np.vstack([neighboring_pixels,new_pixel])
 
-    return count
+
+    return neighboring_pixels

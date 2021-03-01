@@ -134,134 +134,34 @@ def run_simulation(input_filename,
     for itrk in tqdm(range(0, tracks.shape[0], step), desc='Simulating pixels...'):
         selected_tracks = tracks[itrk:itrk+step]
 
-        RangePush("event_id_map")
-        # Here we build a map between tracks and event IDs
-        unique_eventIDs = cp.unique(selected_tracks['eventID'])
-        event_id_map = cp.searchsorted(unique_eventIDs,cp.asarray(selected_tracks['eventID']))
-        RangePop()
+        pixels_tracks = np.empty((0,2),dtype=np.int32)
+        track_ids = np.array([],dtype=np.int32)
 
-        # We find the pixels intersected by the projection of the tracks on
-        # the anode plane using the Bresenham's algorithm. We also take into
-        # account the neighboring pixels, due to the transverse diffusion of the charges.
-        RangePush("pixels_from_track")
-        longest_pix = ceil(max(selected_tracks["dx"])/consts.pixel_size[0])
-        max_radius = ceil(max(selected_tracks["tran_diff"])*5/consts.pixel_size[0])
-        MAX_PIXELS = int((longest_pix*4+6)*max_radius*1.5)
-        MAX_ACTIVE_PIXELS = int(longest_pix*1.5)
-        active_pixels = cp.full((selected_tracks.shape[0], MAX_ACTIVE_PIXELS, 2), -1, dtype=np.int32)
-        neighboring_pixels = cp.full((selected_tracks.shape[0], MAX_PIXELS, 2), -1, dtype=np.int32)
-        n_pixels_list = cp.zeros(shape=(selected_tracks.shape[0]))
-        threadsperblock = 128
-        blockspergrid = ceil(selected_tracks.shape[0] / threadsperblock)
-        pixels_from_track.get_pixels[blockspergrid,threadsperblock](selected_tracks,
-                                                                    active_pixels,
-                                                                    neighboring_pixels,
-                                                                    n_pixels_list,
-                                                                    max_radius+1)
-        RangePop()
+        for it,t in enumerate(selected_tracks):
+            this_border = consts.module_borders[int(t["pixel_plane"])]
+            start_pixel = (int((t["x_start"] - this_border[0][0]) // consts.pixel_size[0] + consts.n_pixels[0]*t["pixel_plane"]),
+                        int((t["y_start"] - this_border[1][0]) // consts.pixel_size[1]))
+            end_pixel = (int((t["x_end"] - this_border[0][0]) // consts.pixel_size[0] + consts.n_pixels[0]*t["pixel_plane"]),
+                        int((t["y_end"] - this_border[1][0]) // consts.pixel_size[1]))
+            pixels = pixels_from_track.get_active_pixels(start_pixel[0], start_pixel[1],
+                                                end_pixel[0], end_pixel[1])
+            neighboring_pixels = pixels_from_track.get_neighboring_pixels(np.array(pixels,dtype=np.int32),2)
+            pixels_tracks = np.vstack((pixels_tracks,neighboring_pixels))
+            track_ids = np.append(track_ids,[it]*len(neighboring_pixels))
 
-        RangePush("unique_pix")
-        shapes = neighboring_pixels.shape
-        joined = neighboring_pixels.reshape(shapes[0]*shapes[1],2)
-        unique_pix = cupy_unique_axis0(joined)
-        unique_pix = unique_pix[(unique_pix[:,0] != -1) & (unique_pix[:,1] != -1),:]
-        RangePop()
-
-        RangePush("time_intervals")
-        # Here we find the longest signal in time and we store an array with the start in time of each track
-        max_length = cp.array([0])
-        track_starts = cp.empty(selected_tracks.shape[0])
-        # d_track_starts = cuda.to_device(track_starts)
+        unique_eventIDs = np.unique(selected_tracks['eventID'])
+        event_id_map = np.searchsorted(unique_eventIDs,selected_tracks['eventID'])
+        max_length = np.array([0])
+        track_starts = np.empty(selected_tracks.shape[0])
         threadsperblock = 128
         blockspergrid = ceil(selected_tracks.shape[0] / threadsperblock)
         detsim.time_intervals[blockspergrid,threadsperblock](track_starts, max_length,  event_id_map, selected_tracks)
-        RangePop()
 
-        RangePush("tracks_current")
-        # Here we calculate the induced current on each pixel
-        signals = cp.zeros((selected_tracks.shape[0],
-                            neighboring_pixels.shape[1],
-                            cp.asnumpy(max_length)[0]), dtype=np.float32)
-        threadsperblock = (4,4,4)
-        blockspergrid_x = ceil(signals.shape[0] / threadsperblock[0])
-        blockspergrid_y = ceil(signals.shape[1] / threadsperblock[1])
-        blockspergrid_z = ceil(signals.shape[2] / threadsperblock[2])
-        blockspergrid = (blockspergrid_x, blockspergrid_y, blockspergrid_z)
-        detsim.tracks_current[blockspergrid,threadsperblock](signals,
-                                                             neighboring_pixels,
-                                                             selected_tracks)
-        RangePop()
+        pixels_tracks_time = np.zeros((pixels_tracks.shape[0],max_length[0]))
+        TPB = 1,512
+        BPG = ceil(pixels_tracks_time.shape[0] / TPB[0]), ceil(pixels_tracks_time.shape[1] / TPB[1])
+        detsim.tracks_current[BPG,TPB](pixels_tracks_time, pixels_tracks, selected_tracks, track_ids)
 
-        RangePush("pixel_index_map")
-        # Here we create a map between tracks and index in the unique pixel array
-        pixel_index_map = cp.full((selected_tracks.shape[0], neighboring_pixels.shape[1]), -1)
-        compare = neighboring_pixels[..., np.newaxis, :] == unique_pix
-        indices = cp.where(cp.logical_and(compare[..., 0], compare[..., 1]))
-        pixel_index_map[indices[0], indices[1]] = indices[2]
-        RangePop()
-
-        RangePush("sum_pixels_signals")
-        # Here we combine the induced current on the same pixels by different tracks
-        threadsperblock = (8,8,8)
-        blockspergrid_x = ceil(signals.shape[0] / threadsperblock[0])
-        blockspergrid_y = ceil(signals.shape[1] / threadsperblock[1])
-        blockspergrid_z = ceil(signals.shape[2] / threadsperblock[2])
-        blockspergrid = (blockspergrid_x, blockspergrid_y, blockspergrid_z)
-        pixels_signals = cp.zeros((len(unique_pix), len(consts.time_ticks)*len(unique_eventIDs)*2))
-        detsim.sum_pixel_signals[blockspergrid,threadsperblock](pixels_signals,
-                                                                signals,
-                                                                track_starts,
-                                                                pixel_index_map)
-        RangePop()
-
-        RangePush("get_adc_values")
-        # Here we simulate the electronics response (the self-triggering cycle) and the signal digitization
-        time_ticks = cp.linspace(0, len(unique_eventIDs)*consts.time_interval[1]*2, pixels_signals.shape[1]+1)
-        integral_list = cp.zeros((pixels_signals.shape[0], fee.MAX_ADC_VALUES))
-        adc_ticks_list = cp.zeros((pixels_signals.shape[0], fee.MAX_ADC_VALUES))
-        TPB = 128
-        BPG = ceil(pixels_signals.shape[0] / TPB)
-
-        rng_states = create_xoroshiro128p_states(TPB * BPG, seed=itrk)
-        fee.get_adc_values[BPG,TPB](pixels_signals,
-                                    time_ticks,
-                                    integral_list,
-                                    adc_ticks_list,
-                                    consts.time_interval[1]*2*tot_events,
-                                    rng_states)
-        adc_list = fee.digitize(integral_list)
-        RangePop()
-
-        RangePush("backtracking")
-        track_pixel_map = np.full((unique_pix.shape[0], 5),-1)
-        backtracked_id = np.full((adc_list.shape[0], adc_list.shape[1], track_pixel_map.shape[1]), -1)
-
-        # Here we backtrack the ADC counts to the Geant4 tracks
-        detsim.get_track_pixel_map(track_pixel_map, cp.asnumpy(unique_pix), cp.asnumpy(neighboring_pixels))
-        detsim.backtrack_adcs(selected_tracks,
-                              cp.asnumpy(adc_list),
-                              cp.asnumpy(adc_ticks_list),
-                              track_pixel_map,
-                              cp.asnumpy(event_id_map),
-                              backtracked_id)
-
-        adc_tot_list = cp.concatenate((adc_tot_list, adc_list), axis=0)
-        adc_tot_ticks_list = cp.concatenate((adc_tot_ticks_list, adc_ticks_list), axis=0)
-        unique_pix_tot = cp.concatenate((unique_pix_tot, unique_pix), axis=0)
-        backtracked_id_tot = cp.concatenate((backtracked_id_tot, cp.asarray(backtracked_id)), axis=0)
-        tot_events += len(unique_eventIDs)
-        RangePop()
-
-    # Here we export the result in a HDF5 file.
-    fee.export_to_hdf5(cp.asnumpy(adc_tot_list),
-                       cp.asnumpy(adc_tot_ticks_list),
-                       cp.asnumpy(unique_pix_tot),
-                       cp.asnumpy(backtracked_id_tot),
-                       output_filename if output_filename else input_filename)
-
-    print("Output saved in:", output_filename if output_filename else input_filename)
-
-    RangePop()
 
 if __name__ == "__main__":
     fire.Fire(run_simulation)
